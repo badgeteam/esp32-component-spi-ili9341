@@ -26,6 +26,10 @@
 #include <freertos/task.h>
 #include <driver/gpio.h>
 
+#include "ice40.h"
+#include "hardware.h"
+#include "../../main/include/fpga_util.h"
+
 #include "include/ili9341.h"
 
 static const char *TAG = "ili9341";
@@ -350,6 +354,67 @@ esp_err_t ili9341_select(ILI9341* device, const bool state) {
 }
 
 esp_err_t ili9341_write(ILI9341* device, const uint8_t *buffer) {
+
+    static bool loaded = false;
+    static uint8_t *buf = NULL;
+    static uint32_t base = 0;
+    int i;
+
+    if (get_ice40()) {
+        if (!loaded) {
+            uint32_t dummy;
+
+            // Load bitstream
+            FILE *fh = fopen("/sd/hdmi.bin", "rb");
+            void *buf = malloc(104090);
+            fread(buf, 104090, 1, fh);
+            fclose(fh);
+            ice40_load_bitstream(get_ice40(), buf, 104090);
+            loaded = true;
+
+            // Initialization
+            struct fpga_wb_cmdbuf *cq = fpga_wb_alloc(16);
+
+            fpga_wb_queue_write(cq, 1, 0x00, 0);	        // Disable HDMI DMA
+            fpga_wb_queue_write(cq, 2, 0x00, 0);	        // Disable SPI DMA
+
+            fpga_wb_queue_write(cq, 0, 0x00, 0x00000004);   // Reset   manual control
+            fpga_wb_queue_write(cq, 0, 0x00, 0x00000002);   // Request manual control
+            fpga_wb_queue_write(cq, 0, 0x40, 0x35000000);   // Send SPI command 0x35 (enable QPI)
+            fpga_wb_queue_read (cq, 0, 0x0c, &dummy);       // Discard RF
+            fpga_wb_queue_write(cq, 0, 0x00, 0x00000004);   // Release manual control
+
+            fpga_wb_queue_write(cq, 1, 0x04, base);         // Set HDMI base address
+            fpga_wb_queue_write(cq, 1, 0x00, 1);	        // Enable HDMI DMA
+
+            fpga_wb_queue_write(cq, 2, 0x04, base);         // Set SPI base address
+            fpga_wb_queue_write(cq, 2, 0x00, 1);	        // Enable SPI DMA
+
+            fpga_wb_exec(cq, get_ice40());
+        }
+
+        if (!buf)
+            buf = malloc(3841);
+
+        // Send 40 buffers of 3840 bytes
+        // (i.e. full frame)
+        buf[0] = 0xe0; // Command byte for SPI DMA write
+
+        for (i=0; i<40; i++) {
+            memcpy(&buf[1], &buffer[3840*i], 3840);
+            ice40_send_turbo(get_ice40(), buf, 3841);
+        }
+
+        // Switch to new frame
+            // - Set the HDMI DMA address to the address we just wrote to
+            // - Set SPI DMA address to the address to write _next_ frame
+        struct fpga_wb_cmdbuf *cq = fpga_wb_alloc(10);
+        fpga_wb_queue_write(cq, 1, 4, base);
+        base ^= (360 * 240 * 2); // Flip
+        fpga_wb_queue_write(cq, 2, 4, base);
+        fpga_wb_exec(cq, get_ice40());
+    }
+
     return ili9341_write_partial_direct(device, buffer, 0, 0, ILI9341_WIDTH, ILI9341_HEIGHT);
 }
 
